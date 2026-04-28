@@ -4078,6 +4078,19 @@ class SubgraphTracer(fx.Tracer):
         if proxy.tracer != self.parent:
             self.parent.lift_tracked_freevar_to_input(proxy)
 
+        # Ensure subclass inner tensor symbols are tracked at the parent.
+        # When a DTensor (or other wrapper subclass) intermediate is produced at
+        # the parent graph, track_produced_symints may not have been called for it
+        # (e.g., when the DTensor came from a dynamo-disabled region like FSDP2
+        # hooks).  Without this, _lift_basic_symbols will try to lift inner tensor
+        # symbols to the root with source=None and hit an assertion.
+        if (
+            isinstance(example_value, torch.Tensor)
+            and is_traceable_wrapper_subclass(example_value)
+            and proxy.tracer is self.parent
+        ):
+            self.parent.track_produced_symints(example_value, proxy)
+
         example_value = proxy.node.meta["example_value"]
         type_expr = (
             type(example_value.real_obj)
@@ -4359,13 +4372,11 @@ class SubgraphTracer(fx.Tracer):
             elif example_value.layout in {torch.sparse_csc, torch.sparse_bsc}:
                 self._lift_basic_symbols(example_value.ccol_indices(), src)
                 self._lift_basic_symbols(example_value.row_indices(), src)
-            if is_traceable_wrapper_subclass(example_value):
+            if is_traceable_wrapper_subclass(example_value) and src is not None:
                 attrs, ctx = example_value.__tensor_flatten__()
                 for attr in attrs:
                     inner_t = getattr(example_value, attr)
-                    self._lift_basic_symbols(
-                        inner_t, AttrSource(src, attr) if src is not None else None
-                    )
+                    self._lift_basic_symbols(inner_t, AttrSource(src, attr))
         elif isinstance(example_value, torch.SymInt):
             _lift_symbols_in_symint(
                 example_value,
