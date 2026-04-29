@@ -25,21 +25,21 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
     RowwiseParallel,
 )
+from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FP8
 from torch.testing._internal.common_device_type import e4m3_type
 from torch.testing._internal.common_utils import (  # type: ignore[attr-defined]
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
-    runOnRocmArch,
     TestCase,
 )
-from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FP8
 from torch.testing._internal.distributed._tensor.common_dtensor import MLPModule
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.testing._internal.inductor_utils import HAS_GPU
 
 
 f8_msg = "FP8 is only supported on H100+, SM 8.9 and MI300+, XPU and CPU devices"
+
 
 def _make_post_grad_fx(f, *inps):
     gm = make_fx(f, decompositions, tracing_mode="fake")(*inps)
