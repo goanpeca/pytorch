@@ -150,16 +150,6 @@ class TestInvokeSubgraph(TestCase):
 
 @skipIfTorchDynamo("Not a torch._dynamo test")
 class TestInvokeSubgraphCompile(TestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        torch._dynamo.config.canonicalize_output_graph_node_order = True
-
-    @classmethod
-    def tearDownClass(cls):
-        torch._dynamo.config.canonicalize_output_graph_node_order = False
-        super().tearDownClass()
-
     def count_unique_get_attr_nodes(self, gm, args, expected):
         subgraph_attr_names = set()
         for node in gm.graph.nodes:
