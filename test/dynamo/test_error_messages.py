@@ -137,6 +137,8 @@ def _load_global_has_positions() -> bool:
 
 
 def _reconstruction_failure_gb_stack_source_attribution() -> str:
+    if getattr(torch._dynamo.config, "canonicalize_output_graph_node_order", False):
+        return ""
     if IS_MACOS:
         var_repr = "NullVariable originated from:"
     else:

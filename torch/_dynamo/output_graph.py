@@ -2798,7 +2798,12 @@ class OutputGraph(OutputGraphCommon):
             # free a bit of memory
             self.real_value_cache.clear()
 
-            if config.canonicalize_output_graph_node_order:
+            if (
+                config.canonicalize_output_graph_node_order
+                and not self.export
+                and not torch.compiler.is_exporting()
+                and not torch._dynamo.compiled_autograd.in_compiled_autograd_region
+            ):
                 _canonicalize_graph(self.graph)
 
             gm = _make_graph_module(root, self.graph)
