@@ -231,11 +231,10 @@ class FunctionalTensor(torch.Tensor):
                 # Otherwise this would be invalid.
                 mode._storage_to_base[out.elem.untyped_storage()] = out
             else:
-                out._inference_mode_base = mode._storage_to_base[
-                    out.elem.untyped_storage()
-                ]
+                storage = out.elem.untyped_storage()
+                out._inference_mode_base = mode._storage_to_base.get(storage)
                 if out._inference_mode_base is None:
-                    raise AssertionError("out._inference_mode_base must not be None")
+                    mode._storage_to_base[storage] = out
         return out
 
     def __torch_dispatch__(  # type: ignore[override]
