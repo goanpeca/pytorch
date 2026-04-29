@@ -6,8 +6,18 @@ import torch
 import torch._dynamo
 import torch._dynamo.testing
 import torch.fx.experimental._config as _fx_experimental_config
+import torch.utils._pytree as pytree
 from torch._dynamo.decorators import mark_static, mark_unbacked, maybe_mark_dynamic
-from torch._dynamo.dynamic_spec import IntSpec, IntSpecType, TensorSpec
+from torch._dynamo.dynamic_spec import (
+    _active_dynamic_shapes,
+    _flatten_dynamic_shapes,
+    get_active_spec_for_arg,
+    get_active_spec_for_dim,
+    IntSpec,
+    IntSpecType,
+    ObjectSpec,
+    TensorSpec,
+)
 from torch._dynamo.test_case import TestCase
 from torch._dynamo.testing import EagerAndRecordGraphs
 from torch.fx.experimental.symbolic_shapes import (
@@ -764,6 +774,354 @@ class TestIntSpecCompile(TestCase):
         # call 1 via the pre-trace mark, no branches, no 0/1 sizes → 1
         # compile. If ``dynamic=False`` had won, we'd see 5 (one per shape).
         self.assertEqual(cnt.frame_count, 1)
+
+
+class TestObjectSpec(TestCase):
+    """Construction, dict-like access, and recursion."""
+
+    def test_empty(self):
+        os = ObjectSpec()
+        self.assertEqual(len(os), 0)
+
+    def test_dict_construction(self):
+        spec = IntSpec.backed("batch")
+        os = ObjectSpec({"x": spec, "n": IntSpec.static()})
+        self.assertEqual(len(os), 2)
+        self.assertIn("x", os)
+        self.assertIs(os["x"], spec)
+
+    def test_fluent_field(self):
+        spec_x = TensorSpec([IntSpec.backed("batch")])
+        spec_n = IntSpec.unbacked("n")
+        os = ObjectSpec().field("x", spec_x).field("n", spec_n)
+        self.assertEqual(len(os), 2)
+        self.assertIs(os["x"], spec_x)
+        self.assertIs(os["n"], spec_n)
+
+    def test_setitem(self):
+        os = ObjectSpec()
+        spec = IntSpec.backed("batch")
+        os["x"] = spec
+        self.assertIs(os["x"], spec)
+
+    def test_iter_and_items(self):
+        spec_x = IntSpec.backed("batch")
+        spec_n = IntSpec.static()
+        os = ObjectSpec({"x": spec_x, "n": spec_n})
+        self.assertEqual(list(os), ["x", "n"])
+        self.assertEqual(list(os.items()), [("x", spec_x), ("n", spec_n)])
+
+    def test_repr(self):
+        # Single field-keyed entry.
+        os = ObjectSpec({"x": IntSpec.static()})
+        self.assertEqual(
+            repr(os),
+            "ObjectSpec({field('x'): IntSpec(type=STATIC)})",
+        )
+
+    def test_repr_multiple_entries(self):
+        # Multiple entries preserve insertion order.
+        os = ObjectSpec({"x": IntSpec.static(), "n": IntSpec.backed("n")})
+        self.assertEqual(
+            repr(os),
+            "ObjectSpec({"
+            "field('x'): IntSpec(type=STATIC), "
+            "field('n'): IntSpec(name='n', type=BACKED)"
+            "})",
+        )
+
+    def test_repr_mixed_field_and_attr(self):
+        os = (
+            ObjectSpec()
+            .field("x", IntSpec.backed("batch"))
+            .attr("weight", TensorSpec([IntSpec.backed("h")]))
+        )
+        self.assertEqual(
+            repr(os),
+            "ObjectSpec({"
+            "field('x'): IntSpec(name='batch', type=BACKED), "
+            "attr('weight'): TensorSpec([IntSpec(name='h', type=BACKED)])"
+            "})",
+        )
+
+    def test_repr_nested_objectspec(self):
+        inner = ObjectSpec().attr("weight", TensorSpec([IntSpec.backed("h")]))
+        outer = ObjectSpec().attr("model", inner).field("x", IntSpec.static())
+        self.assertEqual(
+            repr(outer),
+            "ObjectSpec({"
+            "attr('model'): ObjectSpec({"
+            "attr('weight'): TensorSpec([IntSpec(name='h', type=BACKED)])}), "
+            "field('x'): IntSpec(type=STATIC)"
+            "})",
+        )
+
+    def test_attr_setter(self):
+        spec = TensorSpec([IntSpec.backed("h")])
+        os = ObjectSpec().attr("weight", spec)
+        self.assertIs(os["weight"], spec)
+        self.assertEqual(
+            repr(os),
+            "ObjectSpec({attr('weight'): "
+            "TensorSpec([IntSpec(name='h', type=BACKED)])})",
+        )
+
+    def test_mixed_field_and_attr(self):
+        # Interleaved ``.field`` (item-keyed) and ``.attr``
+        # (attribute-keyed) entries preserve insertion order.
+        spec_x = IntSpec.backed("batch")
+        spec_w = TensorSpec([IntSpec.backed("h")])
+        os = ObjectSpec().field("x", spec_x).attr("weight", spec_w)
+        self.assertIs(os["x"], spec_x)
+        self.assertIs(os["weight"], spec_w)
+        self.assertEqual(list(os), ["x", "weight"])
+
+    def test_recursive_nesting(self):
+        # Recursion in the data class — nested ``ObjectSpec`` is accepted.
+        # Initial integration only consumes top-level entries; nested
+        # entries remain inert at compile time but the class itself
+        # carries them through.
+        inner = ObjectSpec({"weight": TensorSpec([IntSpec.backed("h")])})
+        outer = ObjectSpec({"model": inner, "n": IntSpec.backed("n")})
+        self.assertIs(outer["model"], inner)
+
+
+class TestObjectSpecPytree(TestCase):
+    """``tree_flatten_with_path`` produces the expected paths for
+    ``ObjectSpec`` containing ``IntSpec`` / ``TensorSpec`` leaves."""
+
+    def test_top_level_intspec_leaf(self):
+        spec = IntSpec.backed("n")
+        os = ObjectSpec({"n": spec})
+        leaves_with_paths, _ = pytree.tree_flatten_with_path(os)
+        self.assertEqual(len(leaves_with_paths), 1)
+        path, leaf = leaves_with_paths[0]
+        self.assertEqual(tuple(path), (pytree.MappingKey("n"),))
+        self.assertIs(leaf, spec)
+
+    def test_tensorspec_dims_get_sequence_keys(self):
+        s0 = IntSpec.backed("batch")
+        s1 = IntSpec.static()
+        os = ObjectSpec({"x": TensorSpec([s0, s1])})
+        leaves_with_paths, _ = pytree.tree_flatten_with_path(os)
+        path_to_leaf = {tuple(p): leaf for p, leaf in leaves_with_paths}
+        self.assertIs(path_to_leaf[(pytree.MappingKey("x"), pytree.SequenceKey(0))], s0)
+        self.assertIs(path_to_leaf[(pytree.MappingKey("x"), pytree.SequenceKey(1))], s1)
+
+    def test_flatten_dynamic_shapes_drops_none_leaves(self):
+        # ``None`` per-dim entries flatten as ``None`` leaves and the
+        # helper drops them — the consumer falls through to the default
+        # policy at those slots.
+        os = ObjectSpec({"x": TensorSpec([IntSpec.backed("batch"), None])})
+        path_map = _flatten_dynamic_shapes(os)
+        self.assertEqual(len(path_map), 1)
+        self.assertIn((pytree.MappingKey("x"), pytree.SequenceKey(0)), path_map)
+
+    def test_attr_emits_get_attr_key(self):
+        # ``.attr`` entries get ``GetAttrKey`` paths instead of
+        # ``MappingKey`` — matches ``AttrSource`` in the dynamo builder.
+        spec = IntSpec.backed("h")
+        os = ObjectSpec().attr("weight", spec)
+        leaves_with_paths, _ = pytree.tree_flatten_with_path(os)
+        self.assertEqual(len(leaves_with_paths), 1)
+        path, leaf = leaves_with_paths[0]
+        self.assertEqual(tuple(path), (pytree.GetAttrKey("weight"),))
+        self.assertIs(leaf, spec)
+
+    def test_mixed_kinds_emit_distinct_path_types(self):
+        # In the same ObjectSpec, ``.field`` and ``.attr`` entries emit
+        # different KeyEntry types on their respective paths.
+        s_x = IntSpec.backed("batch")
+        s_w = IntSpec.backed("h")
+        os = ObjectSpec().field("x", s_x).attr("weight", s_w)
+        leaves_with_paths, _ = pytree.tree_flatten_with_path(os)
+        path_to_leaf = {tuple(p): leaf for p, leaf in leaves_with_paths}
+        self.assertIs(path_to_leaf[(pytree.MappingKey("x"),)], s_x)
+        self.assertIs(path_to_leaf[(pytree.GetAttrKey("weight"),)], s_w)
+
+
+class TestObjectSpecContextVar(TestCase):
+    """``_active_dynamic_shapes`` ContextVar + the lookup helpers."""
+
+    def test_unset_context_returns_none(self):
+        # Default state: helpers return None when no spec is active.
+        self.assertIsNone(get_active_spec_for_arg("x"))
+        self.assertIsNone(get_active_spec_for_dim("x", 0))
+
+    def test_get_active_spec_for_arg(self):
+        spec = IntSpec.backed("n")
+        os = ObjectSpec({"n": spec})
+        token = _active_dynamic_shapes.set(_flatten_dynamic_shapes(os))
+        try:
+            self.assertIs(get_active_spec_for_arg("n"), spec)
+            self.assertIsNone(get_active_spec_for_arg("missing"))
+        finally:
+            _active_dynamic_shapes.reset(token)
+
+    def test_get_active_spec_for_dim(self):
+        s0 = IntSpec.backed("batch")
+        s1 = IntSpec.static()
+        os = ObjectSpec({"x": TensorSpec([s0, s1])})
+        token = _active_dynamic_shapes.set(_flatten_dynamic_shapes(os))
+        try:
+            self.assertIs(get_active_spec_for_dim("x", 0), s0)
+            self.assertIs(get_active_spec_for_dim("x", 1), s1)
+            self.assertIsNone(get_active_spec_for_dim("x", 5))
+            self.assertIsNone(get_active_spec_for_dim("missing", 0))
+        finally:
+            _active_dynamic_shapes.reset(token)
+
+
+class TestObjectSpecMatch(TestCase):
+    """``ObjectSpec.match(obj)`` auto-derives a default spec scaffold
+    matching ``obj``'s structure."""
+
+    def test_match_tensor(self):
+        x = torch.randn(2, 3, 4)
+        spec = ObjectSpec.match(x)
+        self.assertIsInstance(spec, TensorSpec)
+        self.assertEqual(spec._dim, 3)
+        # All dims default-policy.
+        for i in range(3):
+            self.assertIsNone(spec[i])
+
+    def test_match_int(self):
+        spec = ObjectSpec.match(5)
+        self.assertIsInstance(spec, IntSpec)
+        self.assertIs(spec._type, IntSpecType.STATIC)
+
+    def test_match_bool_rejected(self):
+        with self.assertRaisesRegex(TypeError, "bool"):
+            ObjectSpec.match(True)
+
+    def test_match_dict(self):
+        result = ObjectSpec.match({"x": torch.randn(2, 3), "n": 4})
+        self.assertIsInstance(result, dict)
+        self.assertIsInstance(result["x"], TensorSpec)
+        self.assertEqual(result["x"]._dim, 2)
+        self.assertIsInstance(result["n"], IntSpec)
+
+    def test_match_list_and_tuple_preserve_type(self):
+        as_list = ObjectSpec.match([torch.randn(2), torch.randn(3, 4)])
+        self.assertIsInstance(as_list, list)
+        self.assertEqual(as_list[0]._dim, 1)
+        self.assertEqual(as_list[1]._dim, 2)
+
+        as_tuple = ObjectSpec.match((torch.randn(2),))
+        self.assertIsInstance(as_tuple, tuple)
+        self.assertEqual(as_tuple[0]._dim, 1)
+
+    def test_match_nn_module(self):
+        # Single-level module: parameters become attr-keyed TensorSpec
+        # entries; the result mirrors the module's attribute layout.
+        class Linear(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(4, 3))
+                self.bias = torch.nn.Parameter(torch.randn(4))
+
+        spec = ObjectSpec.match(Linear())
+        self.assertIsInstance(spec, ObjectSpec)
+        self.assertIn("weight", spec)
+        self.assertIn("bias", spec)
+        self.assertEqual(spec["weight"]._dim, 2)
+        self.assertEqual(spec["bias"]._dim, 1)
+
+    def test_match_nested_nn_module(self):
+        # Nested module: child modules nest as ObjectSpec under .attr;
+        # parameters of the outer module appear alongside.
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(4, 3))
+
+        class Outer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = Inner()
+                self.bias = torch.nn.Parameter(torch.randn(4))
+
+        spec = ObjectSpec.match(Outer())
+        self.assertIsInstance(spec["inner"], ObjectSpec)
+        self.assertIsInstance(spec["inner"]["weight"], TensorSpec)
+        self.assertIsInstance(spec["bias"], TensorSpec)
+
+    def test_match_nn_module_with_buffer(self):
+        class WithBuffer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(2))
+                self.register_buffer("running_mean", torch.zeros(2))
+
+        spec = ObjectSpec.match(WithBuffer())
+        self.assertIn("weight", spec)
+        self.assertIn("running_mean", spec)
+        self.assertEqual(spec["running_mean"]._dim, 1)
+
+    def test_match_unknown_type_rejected(self):
+        with self.assertRaisesRegex(TypeError, "cannot derive a spec for"):
+            ObjectSpec.match("not a spec source")
+
+    def test_match_tensor_repr(self):
+        spec = ObjectSpec.match(torch.randn(2, 3))
+        self.assertEqual(repr(spec), "TensorSpec([None, None])")
+
+    def test_match_int_repr(self):
+        self.assertEqual(repr(ObjectSpec.match(5)), "IntSpec(type=STATIC)")
+
+    def test_match_dict_repr(self):
+        # Native dict carries through; leaf reprs come from IntSpec /
+        # TensorSpec themselves.
+        result = ObjectSpec.match({"x": torch.randn(2), "n": 4})
+        self.assertEqual(
+            repr(result),
+            "{'x': TensorSpec([None]), 'n': IntSpec(type=STATIC)}",
+        )
+
+    def test_match_list_repr(self):
+        result = ObjectSpec.match([torch.randn(2), torch.randn(3, 4)])
+        self.assertEqual(
+            repr(result),
+            "[TensorSpec([None]), TensorSpec([None, None])]",
+        )
+
+    def test_match_nn_module_repr(self):
+        class Linear(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(4, 3))
+                self.bias = torch.nn.Parameter(torch.randn(4))
+
+        spec = ObjectSpec.match(Linear())
+        self.assertEqual(
+            repr(spec),
+            "ObjectSpec({"
+            "attr('weight'): TensorSpec([None, None]), "
+            "attr('bias'): TensorSpec([None])"
+            "})",
+        )
+
+    def test_match_nested_nn_module_repr(self):
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(4, 3))
+
+        class Outer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = Inner()
+                self.bias = torch.nn.Parameter(torch.randn(4))
+
+        spec = ObjectSpec.match(Outer())
+        self.assertEqual(
+            repr(spec),
+            "ObjectSpec({"
+            "attr('inner'): ObjectSpec({"
+            "attr('weight'): TensorSpec([None, None])}), "
+            "attr('bias'): TensorSpec([None])"
+            "})",
+        )
 
 
 if __name__ == "__main__":
