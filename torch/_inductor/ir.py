@@ -6095,11 +6095,9 @@ class ConcatKernel(NopKernel):
                 "val" in arg.meta
                 and (
                     # pyrefly: ignore [missing-attribute]
-                    arg.meta["val"].is_contiguous(memory_format=torch.channels_last)
+                    is_contiguous_for_memory_format_or_false(arg.meta["val"], memory_format=torch.channels_last)
                     # pyrefly: ignore [missing-attribute]
-                    or arg.meta["val"].is_contiguous(
-                        memory_format=torch.channels_last_3d
-                    )
+                    or is_contiguous_for_memory_format_or_false(arg.meta["val"], memory_format=torch.channels_last_3d)
                 )
                 for arg in fx_node_args
             )
