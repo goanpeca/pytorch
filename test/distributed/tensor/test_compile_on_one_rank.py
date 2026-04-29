@@ -10,6 +10,9 @@ import torch.distributed.config as dist_config
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import parallelize_module, RowwiseParallel
+from torch.testing._internal.common_distributed import (
+    DynamoDistributedSingleProcTestCase,
+)
 from torch.testing._internal.common_utils import run_tests, TEST_WITH_DEV_DBG_ASAN
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
@@ -152,6 +155,20 @@ class TestCompileOnOneRank(DTensorTestBase):
 
         compiled_model(replicated_inp)
         self._assert_graphs_identical_across_ranks(fw_graph_cell[0])
+
+    @dist_config.patch(compile_on_one_rank=True)
+    def test_all_reduce_with_explicit_pg_input(self):
+        pg = dist.distributed_c10d._get_default_group()
+
+        def f(t, group):
+            t = t.clone()
+            dist.all_reduce(t, group=group)
+            return t + 1
+
+        x = torch.arange(4, dtype=torch.float32, device=self.device)
+        opt = torch.compile(f, backend="inductor", fullgraph=True)
+        out = opt(x, pg)
+        self.assertEqual(out, f(x, pg))
 
     @with_comms
     @dist_config.patch(compile_on_one_rank=True)
