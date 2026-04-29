@@ -559,11 +559,13 @@ class CachingAutotuner(KernelInterface):
         self.compile_results = compile_results
         self.configs = None
 
-    def _dynamic_scale_rblock(self):
-        # TODO(jansel): we should find a way to move this extra compile into the worker process
-        # Currently it relies on _make_launchers(), which requires a cuda context, to populate nreg.
+    @functools.cached_property
+    def _could_rblock_scale(self) -> bool:
+        """Whether ``_dynamic_scale_rblock`` should attempt occupancy-
+        driven rblock halving for this autotuner.
+        """
         device_prop = self.device_props
-        if (
+        return (
             not self.deterministic_mode
             and self.inductor_meta.get("dynamic_scale_rblock", True)
             and not self.inductor_meta.get("persistent_reduction")
@@ -571,10 +573,17 @@ class CachingAutotuner(KernelInterface):
             and self.size_hints is not None
             # Disable for Intel as Triton is not ready to return n_regs for a compiled_binary.
             and device_prop.type in ["cuda", "hip"]
-            and device_prop.major
+            and bool(device_prop.major)
             and (device_prop.major >= 8 or torch.version.hip)
             and device_prop.regs_per_multiprocessor is not None
-        ):
+        )
+
+    def _iter_rblock_scale_candidates(self):
+        """Yield new configs with halved rblock for occupancy improvement."""
+        # TODO(jansel): we should find a way to move this extra compile into the worker process
+        # Currently it relies on _make_launchers(), which requires a cuda context, to populate nreg.
+        if self._could_rblock_scale:
+            device_prop = self.device_props
             assert device_prop.regs_per_multiprocessor
             assert device_prop.max_threads_per_multi_processor
             assert device_prop.multi_processor_count
@@ -660,9 +669,12 @@ class CachingAutotuner(KernelInterface):
                     new_config,
                 )
                 self._ensure_kernel_loaded()
-                self.compile_results.append(self._precompile_config(new_config))  # noqa: B909
+                yield new_config
 
-            self._make_launchers()
+    def _dynamic_scale_rblock(self):
+        for new_config in self._iter_rblock_scale_candidates():
+            self.compile_results.append(self._precompile_config(new_config))  # noqa: B909
+        self._make_launchers()
 
     def compile_by_disabling_pipelining(self, config):
         self._ensure_kernel_loaded()
