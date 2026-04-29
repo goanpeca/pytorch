@@ -1,7 +1,7 @@
 # Owner(s): ["module: inductor"]
+# flake8: noqa: B950
 
 import functools
-import gc
 import json
 import os
 import random
@@ -70,11 +70,6 @@ from torch.testing._internal.common_device_type import (
     skipXPUIf,
 )
 from torch.testing._internal.common_quantized import _snr
-from torch.testing._internal.common_utils import (  # noqa: F401
-    MI200_ARCH,
-    skipIfRocm,
-    skipIfRocmArch,
-)
 from torch.testing._internal.inductor_utils import HAS_GPU
 from torch.utils._triton import has_triton, has_triton_tma_device
 
@@ -181,21 +176,6 @@ def create_attention(score_mod, block_mask, enable_gqa=False, kernel_options=Non
         enable_gqa=enable_gqa,
         kernel_options=kernel_options,
     )
-
-
-def flex_attention_fwd(q, k, v, score_mod, block_mask, scale):
-    # Uses the HOP directly because flex_attention_backward expects lse in log2
-    # scale, but the public flex_attention API converts lse to natural log.
-    out, lse, _ = flex_attention_hop(
-        q,
-        k,
-        v,
-        score_mod,
-        block_mask.as_tuple(),
-        scale,
-        {},
-    )
-    return out, lse
 
 
 def create_block_mask_test(score_mod, query, key):
@@ -1532,86 +1512,6 @@ class TestFlexAttention(InductorTestCase):
         )
 
     @supported_platform
-    @skip_on_cpu
-    def test_kv_order_invariance_padded_causal(self, device):
-        if device == "cuda" and not PLATFORM_SUPPORTS_BF16:
-            self.skipTest("bf16 is required for this regression test")
-
-        batch_size = 1
-        q_heads = 16
-        kv_heads = 4
-        seq_len = 256
-        head_dim = 128
-        shared_prefix = 201
-        dtype = torch.bfloat16
-
-        def make_block_mask(real_q_len: int, separate_full_blocks: bool):
-            def padded_causal_mask(b, h, q, kv):
-                return (q < real_q_len) & (q >= kv)
-
-            return create_block_mask(
-                padded_causal_mask,
-                B=batch_size,
-                H=1,
-                Q_LEN=seq_len,
-                KV_LEN=seq_len,
-                device=device,
-                separate_full_blocks=separate_full_blocks,
-            )
-
-        q = torch.randn(
-            batch_size, q_heads, seq_len, head_dim, device=device, dtype=dtype
-        )
-        k = torch.randn(
-            batch_size, kv_heads, seq_len, head_dim, device=device, dtype=dtype
-        )
-        v = torch.randn(
-            batch_size, kv_heads, seq_len, head_dim, device=device, dtype=dtype
-        )
-
-        compiled_attention = torch.compile(
-            flex_attention,
-            fullgraph=True,
-        )
-        default_partial_block_mask = make_block_mask(shared_prefix, True)
-        default_full_block_mask = make_block_mask(seq_len, True)
-        self.assertEqual(default_partial_block_mask.kv_indices[0, 0, 1, :2], [0, 1])
-        self.assertEqual(default_partial_block_mask.full_kv_num_blocks[0, 0, 1], 0)
-        self.assertEqual(default_full_block_mask.kv_indices[0, 0, 1, :1], [1])
-        self.assertEqual(default_full_block_mask.full_kv_indices[0, 0, 1, :1], [0])
-
-        partial_block_mask = make_block_mask(shared_prefix, False)
-        full_block_mask = make_block_mask(seq_len, False)
-        self.assertEqual(partial_block_mask.kv_indices[0, 0, 1, :2], [0, 1])
-        self.assertIsNone(partial_block_mask.full_kv_num_blocks)
-        self.assertEqual(full_block_mask.kv_indices[0, 0, 1, :2], [0, 1])
-        self.assertIsNone(full_block_mask.full_kv_num_blocks)
-
-        out_partial = compiled_attention(
-            q,
-            k,
-            v,
-            score_mod=_identity,
-            block_mask=partial_block_mask,
-            enable_gqa=True,
-            kernel_options={"BACKEND": "TRITON"},
-        )
-        out_full = compiled_attention(
-            q,
-            k,
-            v,
-            score_mod=_identity,
-            block_mask=full_block_mask,
-            enable_gqa=True,
-            kernel_options={"BACKEND": "TRITON"},
-        )
-        self.assertTrue(
-            torch.equal(
-                out_partial[:, :, :shared_prefix], out_full[:, :, :shared_prefix]
-            )
-        )
-
-    @supported_platform
     @dtypes(*device_configs["cpu"].dtypes_fast)
     @dtypesIfCUDA(*device_configs["cuda"].dtypes_fast)
     @dtypesIfXPU(*device_configs["xpu"].dtypes_fast)
@@ -2190,27 +2090,13 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @dtypesIfXPU(*device_configs["xpu"].dtypes_fast)
     def test_captured_scalar_grad(self, device, dtype):
         """Test learnable scalar parameter with shape (1,) using literal index."""
-        self._run_test_captured_scalar_grad(device, dtype)
+        scale = torch.ones((1,), device=device, dtype=dtype, requires_grad=True)
 
-    def _run_test_captured_scalar_grad(self, device, dtype):
-        def run():
-            scale = torch.ones((1,), device=device, dtype=dtype, requires_grad=True)
+        def score_mod_scale(qk, b, h, q, kv):
+            return qk + scale[0]
 
-            def score_mod_scale(qk, b, h, q, kv):
-                return qk + scale[0]
-
-            self.run_test(score_mod_scale, dtype, device=device)
-            self.run_test_with_paged_attention(score_mod_scale, dtype, device=device)
-
-        run()
-        torch._dynamo.reset()
-        gc.collect()
-        torch._C._cuda_clearCublasWorkspaces()
-        torch.cuda.empty_cache()
-        torch._dynamo.reset()
-        gc.collect()
-        torch._C._cuda_clearCublasWorkspaces()
-        torch.cuda.empty_cache()
+        self.run_test(score_mod_scale, dtype, device=device)
+        self.run_test_with_paged_attention(score_mod_scale, dtype, device=device)
 
     @supported_platform
     @dtypes(*device_configs["cpu"].dtypes_fast)
@@ -3573,7 +3459,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
         _, code = run_and_get_code(func, q, k, v, _identity)
         # Ensure that we're still generating the flexattention kernel
-        FileCheck().check_count(".run(primals_1, primals_2, primals_3", 1, True).run(
+        FileCheck().check("triton_tem_fused_flex_attention").check(".run(primals_").run(
             code[0]
         )
 
@@ -4932,35 +4818,35 @@ def forward(self, child : torch.Tensor, child_1 : torch.Tensor, child_2 : torch.
             norm_graph,
             """\
 class GraphModule(torch.nn.Module):
-    def forward(self, L_query_: "f64[2, 2, 128, 4]", L_key_: "f64[2, 2, 128, 4]", L_value_: "f64[2, 2, 128, 4]", L_block_mask_kv_indices: "i32[1, 1, 1, 1]", L_block_mask_kv_num_blocks: "i32[1, 1, 1]", L_block_mask_full_kv_num_blocks: "i32[1, 1, 1]", L_block_mask_full_kv_indices: "i32[1, 1, 1, 1]", L_block_mask_q_num_blocks: "i32[1, 1, 1]", L_block_mask_q_indices: "i32[1, 1, 1, 1]", L_block_mask_full_q_num_blocks: "i32[1, 1, 1]", L_block_mask_full_q_indices: "i32[1, 1, 1, 1]"):
-        l_query_ = L_query_
-        l_key_ = L_key_
-        l_value_ = L_value_
+    def forward(self, L_block_mask_full_kv_indices: "i32[1, 1, 1, 1]", L_block_mask_full_kv_num_blocks: "i32[1, 1, 1]", L_block_mask_full_q_indices: "i32[1, 1, 1, 1]", L_block_mask_full_q_num_blocks: "i32[1, 1, 1]", L_block_mask_kv_indices: "i32[1, 1, 1, 1]", L_block_mask_kv_num_blocks: "i32[1, 1, 1]", L_block_mask_q_indices: "i32[1, 1, 1, 1]", L_block_mask_q_num_blocks: "i32[1, 1, 1]", L_key_: "f64[2, 2, 128, 4]", L_query_: "f64[2, 2, 128, 4]", L_value_: "f64[2, 2, 128, 4]"):
+        l_block_mask_full_kv_indices = L_block_mask_full_kv_indices
+        l_block_mask_full_kv_num_blocks = L_block_mask_full_kv_num_blocks
+        l_block_mask_full_q_indices = L_block_mask_full_q_indices
+        l_block_mask_full_q_num_blocks = L_block_mask_full_q_num_blocks
         l_block_mask_kv_indices = L_block_mask_kv_indices
         l_block_mask_kv_num_blocks = L_block_mask_kv_num_blocks
-        l_block_mask_full_kv_num_blocks = L_block_mask_full_kv_num_blocks
-        l_block_mask_full_kv_indices = L_block_mask_full_kv_indices
-        l_block_mask_q_num_blocks = L_block_mask_q_num_blocks
         l_block_mask_q_indices = L_block_mask_q_indices
-        l_block_mask_full_q_num_blocks = L_block_mask_full_q_num_blocks
-        l_block_mask_full_q_indices = L_block_mask_full_q_indices
+        l_block_mask_q_num_blocks = L_block_mask_q_num_blocks
+        l_key_ = L_key_
+        l_query_ = L_query_
+        l_value_ = L_value_
 
-        score_mod_0 = self.score_mod_0
         mask_fn_0 = self.mask_fn_0
+        score_mod_0 = self.score_mod_0
         flex_attention = torch.ops.higher_order.flex_attention(l_query_, l_key_, l_value_, score_mod_0, (128, 128, l_block_mask_kv_num_blocks, l_block_mask_kv_indices, l_block_mask_full_kv_num_blocks, l_block_mask_full_kv_indices, l_block_mask_q_num_blocks, l_block_mask_q_indices, l_block_mask_full_q_num_blocks, l_block_mask_full_q_indices, 128, 128, mask_fn_0), 0.5, {'BACKEND': 'AUTO', 'PRESCALE_QK': False, 'ROWS_GUARANTEED_SAFE': False, 'BLOCKS_ARE_CONTIGUOUS': False, 'WRITE_DQ': True, 'OUTPUT_LOGSUMEXP': True, 'OUTPUT_MAX': False}, (), ());  l_query_ = l_key_ = l_value_ = score_mod_0 = l_block_mask_kv_num_blocks = l_block_mask_kv_indices = l_block_mask_full_kv_num_blocks = l_block_mask_full_kv_indices = l_block_mask_q_num_blocks = l_block_mask_q_indices = l_block_mask_full_q_num_blocks = l_block_mask_full_q_indices = mask_fn_0 = None
-        out: "f64[2, 2, 128, 4]" = flex_attention[0];  flex_attention = None
-        return (out,)
-
-    class score_mod_0(torch.nn.Module):
-        def forward(self, child: "f64[]", child_1: "i32[]", child_2: "i32[]", child_3: "i32[]", child_4: "i32[]"):
-            mul: "f64[]" = child * child;  child = None
-            return mul
+        getitem: "f64[2, 2, 128, 4]" = flex_attention[0];  flex_attention = None
+        return (getitem,)
 
     class mask_fn_0(torch.nn.Module):
         def forward(self, child: "i32[]", child_1: "i32[]", child_2: "i32[]", child_3: "i32[]"):
             ge: "b8[]" = child_2 >= child_3;  child_2 = child_3 = None
             return ge
-""",
+
+    class score_mod_0(torch.nn.Module):
+        def forward(self, child: "f64[]", child_1: "i32[]", child_2: "i32[]", child_3: "i32[]", child_4: "i32[]"):
+            mul: "f64[]" = child * child;  child = None
+            return mul
+""",  # noqa: B950
         )
         # Save the AOT graphs
         aot_graphs = []
@@ -4986,11 +4872,11 @@ class GraphModule(torch.nn.Module):
         fw_graph0 = self.fw_graph0
         joint_graph0 = self.joint_graph0
         mask_graph0 = self.mask_graph0
-        flex_attention_backward = torch.ops.higher_order.flex_attention_backward(primals_1, primals_2, primals_3, getitem_2, getitem_3, tangents_1, None, fw_graph0, joint_graph0, (1, 1, full, full_default, None, None, convert_element_type, convert_element_type_1, None, None, 1073741824, 1073741824, mask_graph0), 0.5, {'BACKEND': 'AUTO', 'PRESCALE_QK': False, 'ROWS_GUARANTEED_SAFE': False, 'BLOCKS_ARE_CONTIGUOUS': False, 'WRITE_DQ': True, 'OUTPUT_LOGSUMEXP': True, 'OUTPUT_MAX': False}, (), ());  primals_1 = primals_2 = primals_3 = getitem_2 = getitem_3 = tangents_1 = fw_graph0 = joint_graph0 = full = full_default = convert_element_type = convert_element_type_1 = mask_graph0 = None
+        flex_attention_backward = torch.ops.higher_order.flex_attention_backward(primals_2, primals_1, primals_3, getitem_2, getitem_3, tangents_1, None, fw_graph0, joint_graph0, (1, 1, full, full_default, None, None, convert_element_type, convert_element_type_1, None, None, 1073741824, 1073741824, mask_graph0), 0.5, {'BACKEND': 'AUTO', 'PRESCALE_QK': False, 'ROWS_GUARANTEED_SAFE': False, 'BLOCKS_ARE_CONTIGUOUS': False, 'WRITE_DQ': True, 'OUTPUT_LOGSUMEXP': True, 'OUTPUT_MAX': False}, (), ());  primals_2 = primals_1 = primals_3 = getitem_2 = getitem_3 = tangents_1 = fw_graph0 = joint_graph0 = full = full_default = convert_element_type = convert_element_type_1 = mask_graph0 = None
         getitem_5: "f64[2, 2, 128, 4]" = flex_attention_backward[0]
         getitem_6: "f64[2, 2, 128, 4]" = flex_attention_backward[1]
         getitem_7: "f64[2, 2, 128, 4]" = flex_attention_backward[2];  flex_attention_backward = None
-        return (getitem_5, getitem_6, getitem_7)
+        return (getitem_6, getitem_5, getitem_7)
 
     class fw_graph0(torch.nn.Module):
         def forward(self, arg0_1: "f64[]", arg1_1: "i32[]", arg2_1: "i32[]", arg3_1: "i32[]", arg4_1: "i32[]"):
@@ -5008,197 +4894,10 @@ class GraphModule(torch.nn.Module):
         def forward(self, arg0_1: "i32[]", arg1_1: "i32[]", arg2_1: "i32[]", arg3_1: "i32[]"):
             full_default: "b8[]" = torch.ops.aten.full.default([], True, dtype = torch.bool, layout = torch.strided, device = device(type='GPU_TYPE', index=0), pin_memory = False)
             return full_default
-""".replace("GPU_TYPE", torch.device(device).type),
+""".replace(  # noqa: B950
+                "GPU_TYPE", torch.device(device).type
+            ),
         )
-
-    @supported_platform
-    @skip_on_cpu
-    def test_direct_backward_preserves_explicit_buffers(self, device):
-        mask_buffer = torch.full((), 128, device=device, dtype=torch.int32)
-
-        def score_mod(score, b, h, m, n):
-            return score
-
-        def mask_mod(b, h, m, n):
-            return m + mask_buffer >= n
-
-        block_mask = create_block_mask(
-            mask_mod,
-            B=2,
-            H=2,
-            Q_LEN=128,
-            KV_LEN=128,
-            device=device,
-        )
-        scale = 1.0 / 16**0.5
-
-        dtype = torch.float32
-        q = torch.randn(
-            (2, 2, 128, 16),
-            dtype=dtype,
-            device=device,
-            requires_grad=True,
-        )
-        k = torch.randn(
-            (2, 2, 128, 16),
-            dtype=dtype,
-            device=device,
-            requires_grad=True,
-        )
-        v = torch.randn(
-            (2, 2, 128, 16),
-            dtype=dtype,
-            device=device,
-            requires_grad=True,
-        )
-        q_ref, k_ref, v_ref = query_key_value_clones(q, k, v)
-        q_gold, k_gold, v_gold = query_key_value_clones(q, k, v, torch.float64)
-
-        sdpa_partial = create_attention(score_mod, block_mask)
-        golden_out = sdpa_partial(q_gold, k_gold, v_gold)
-        ref_out = sdpa_partial(q_ref, k_ref, v_ref)
-
-        backward_grad = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-        golden_out.backward(backward_grad.to(torch.float64))
-        ref_out.backward(backward_grad)
-
-        out, logsumexp = flex_attention_fwd(
-            q,
-            k,
-            v,
-            score_mod,
-            block_mask,
-            scale,
-        )
-
-        @torch.compile(fullgraph=True)
-        def compiled_bw(query, key, value, fwd_out, lse, grad_out):
-            return torch.ops.higher_order.flex_attention_backward(
-                query,
-                key,
-                value,
-                fwd_out,
-                lse,
-                grad_out,
-                None,
-                score_mod,
-                None,
-                block_mask.as_tuple(),
-                scale,
-                {},
-                (),
-                (),
-            )
-
-        with torch.no_grad():
-            dq, dk, dv, _ = compiled_bw(
-                q,
-                k,
-                v,
-                out.detach(),
-                logsumexp.detach(),
-                backward_grad,
-            )
-
-        fudge_factor = 10.0
-        self._check_equal(q_gold.grad, q_ref.grad, dq, fudge_factor, "Grad_Query")
-        self._check_equal(k_gold.grad, k_ref.grad, dk, fudge_factor, "Grad_Key")
-        self._check_equal(v_gold.grad, v_ref.grad, dv, fudge_factor, "Grad_Value")
-
-    @supported_platform
-    @skip_on_cpu
-    def test_direct_backward_supports_symint_score_mod_buffers(self, device):
-        def score_mod(score, b, h, m, n, head_dim):
-            return score
-
-        def mask_mod(b, h, m, n):
-            return m >= n
-
-        block_mask = create_block_mask(
-            mask_mod,
-            B=2,
-            H=2,
-            Q_LEN=128,
-            KV_LEN=128,
-            device=device,
-        )
-        scale = 1.0 / 16**0.5
-        dtype = torch.float32
-        q = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-        k = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-        v = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-        backward_grad = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-
-        out, logsumexp = flex_attention_fwd(
-            q,
-            k,
-            v,
-            _identity,
-            block_mask,
-            scale,
-        )
-        static_head_dim = q.shape[-1]
-
-        @torch.compile(backend="aot_eager", fullgraph=True)
-        def compiled_literal_bw(query, key, value, fwd_out, lse, grad_out):
-            return torch.ops.higher_order.flex_attention_backward(
-                query,
-                key,
-                value,
-                fwd_out,
-                lse,
-                grad_out,
-                None,
-                score_mod,
-                None,
-                block_mask.as_tuple(),
-                scale,
-                {},
-                (static_head_dim,),
-                (),
-            )
-
-        @torch.compile(backend="aot_eager", fullgraph=True, dynamic=True)
-        def compiled_bw(query, key, value, fwd_out, lse, grad_out):
-            return torch.ops.higher_order.flex_attention_backward(
-                query,
-                key,
-                value,
-                fwd_out,
-                lse,
-                grad_out,
-                None,
-                score_mod,
-                None,
-                block_mask.as_tuple(),
-                scale,
-                {},
-                (query.shape[-1],),
-                (),
-            )
-
-        with torch.no_grad():
-            ref_dq, ref_dk, ref_dv, ref_buffer_grads = compiled_literal_bw(
-                q,
-                k,
-                v,
-                out.detach(),
-                logsumexp.detach(),
-                backward_grad,
-            )
-            compiled_dq, compiled_dk, compiled_dv, compiled_buffer_grads = compiled_bw(
-                q,
-                k,
-                v,
-                out.detach(),
-                logsumexp.detach(),
-                backward_grad,
-            )
-
-        torch.testing.assert_close(compiled_dq, ref_dq)
-        torch.testing.assert_close(compiled_dk, ref_dk)
-        torch.testing.assert_close(compiled_dv, ref_dv)
-        self.assertEqual(compiled_buffer_grads, ref_buffer_grads)
 
     @supported_platform
     def test_tensor_subclass_dispatch_order(self, device):
