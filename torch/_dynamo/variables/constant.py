@@ -236,7 +236,9 @@ its type to `common_constant_types`.
                     "1 args and 0 kwargs",
                     f"{len(args)} args and {len(kwargs)} kwargs",
                 )
-            arg_unpacked = args[0].force_unpack_var_sequence(tx)
+            from .object_protocol import unpack_iterator
+
+            arg_unpacked = unpack_iterator(tx, args[0])
             try:
                 arg_const = [x.as_python_constant() for x in arg_unpacked]
                 return ConstantVariable.create(self.value.join(arg_const))

@@ -541,14 +541,6 @@ class SetVariable(VariableTracker):
             tx.output.side_effects.mutation(self)
             self.items.clear()
             return ConstantVariable.create(None)
-        elif name == "__iter__":
-            from .lists import ListIteratorVariable
-
-            if self.source and not is_constant_source(self.source):
-                tx.output.guard_on_key_order.add(self.source)
-            return ListIteratorVariable(
-                self.unpack_var_sequence(tx), mutation_type=ValueMutationNew()
-            )
         return super().call_method(tx, name, args, kwargs)
 
     def python_type_var(self) -> "BuiltinVariable":
@@ -633,7 +625,9 @@ class OrderedSetClassVariable(VariableTracker):
             # pyrefly: ignore [implicit-any]
             items = []
         else:
-            items = args[0].force_unpack_var_sequence(tx)
+            from .object_protocol import unpack_iterator
+
+            items = unpack_iterator(tx, args[0])
         return variables.OrderedSetVariable(items, mutation_type=ValueMutationNew())
 
 
