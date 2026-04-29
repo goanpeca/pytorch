@@ -2312,6 +2312,7 @@ def use_decompose_k_choice(
 
     decompose_k_threshold = config.triton.decompose_k_threshold * threshold_multiple
 
+    aoti_supported = bool(torch.version.hip)
     return (
         V.graph.sizevars.statically_known_true(
             sympy.And(
@@ -2319,8 +2320,8 @@ def use_decompose_k_choice(
                 sympy.Ge(k, decompose_k_threshold * n),
             )
         )
-        and not V.graph.aot_mode  # TODO: Support AOTI for decomposeK
-        and not V.graph.cpp_wrapper
+        and (aoti_supported or not V.graph.aot_mode)
+        and (aoti_supported or not V.graph.cpp_wrapper)
         and config.triton.num_decompose_k_splits > 0
     )
 
