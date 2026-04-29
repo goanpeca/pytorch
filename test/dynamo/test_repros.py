@@ -105,11 +105,10 @@ if HAS_MSGSPEC:
     import msgspec
 
 
-HAS_OMEGACONG = importlib.util.find_spec("omegaconf")
-if HAS_OMEGACONG:
+HAS_OMEGACONF = importlib.util.find_spec("omegaconf")
+if HAS_OMEGACONF:
     from omegaconf import OmegaConf
 
-HAS_CUDA = torch.cuda.is_available()
 
 
 def exists(val):
@@ -4656,7 +4655,7 @@ class ReproTests(torch._dynamo.test_case.TestCase):
                 pass
 
         def fn(x, y):
-            ucm = UserCtxManager()  # noqa: F841
+            ucm = UserCtxManager()
             return x * x
 
         cnt = torch._dynamo.testing.CompileCounter()
@@ -4725,7 +4724,7 @@ class ReproTests(torch._dynamo.test_case.TestCase):
                 pass
 
         def fn(x, y):
-            ucm = UserCtxManager(y)  # noqa: F841
+            ucm = UserCtxManager(y)
             return x * y[0]
 
         cnt = torch._dynamo.testing.CompileCounter()
@@ -4749,7 +4748,7 @@ class ReproTests(torch._dynamo.test_case.TestCase):
 
         def fn(x, counter):
             x = x * x
-            ucm = UserCtxManager(counter)  # noqa: F841
+            ucm = UserCtxManager(counter)
             return x * x
 
         cnt = torch._dynamo.testing.CompileCounter()
@@ -6201,7 +6200,7 @@ def forward(self, s77 : torch.SymInt, s27 : torch.SymInt, L_x_ : torch.Tensor):
 
         @torch.compile(backend="aot_eager_decomp_partition")
         def f(x, l):
-            z = x.sin()  # noqa: F841
+            z = x.sin()
             y = x + 1
             # graph input has its storage mutated
             torch.ops.fsdp.copy_.default(x, y)
@@ -6630,7 +6629,7 @@ def forward(self, s77 : torch.SymInt, s27 : torch.SymInt, L_x_ : torch.Tensor):
         opt_fn = torch.compile(fn, backend="eager")
         self.assertEqual(fn(x), opt_fn(x))
 
-    @unittest.skipIf(not HAS_OMEGACONG, "missing omegaconf package")
+    @unittest.skipIf(not HAS_OMEGACONF, "missing omegaconf package")
     def test_omegaconf_dictconfig(self):
         def fn(cfg, x):
             a = cfg["foo"].a * x
@@ -6650,7 +6649,7 @@ def forward(self, s77 : torch.SymInt, s27 : torch.SymInt, L_x_ : torch.Tensor):
         self.assertEqual(fn(config, x), opt_fn(config, x))
         self.assertEqual(cloned_config.baz, 4)
 
-    @unittest.skipIf(not HAS_OMEGACONG, "missing omegaconf package")
+    @unittest.skipIf(not HAS_OMEGACONF, "missing omegaconf package")
     def test_omegaconf_listconfig_contains(self):
         def fn(cfg, x):
             if 1 in cfg:
@@ -8317,7 +8316,7 @@ class ReproTestsDevice(torch._dynamo.test_case.TestCase):
 
         def fn(x):
             foo = Foo()
-            bar = type(foo)()  # noqa: F841
+            bar = type(foo)()
             return torch.cos(x)
 
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
