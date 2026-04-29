@@ -41,7 +41,8 @@ COPY requirements-ci.txt requirements-docs.txt /opt/conda/
 COPY ./common/install_conda.sh install_conda.sh
 COPY ./common/common_utils.sh common_utils.sh
 COPY ./common/install_magma_conda.sh install_magma_conda.sh
-RUN bash ./install_conda.sh && rm install_conda.sh install_magma_conda.sh common_utils.sh /opt/conda/requirements-ci.txt /opt/conda/requirements-docs.txt
+COPY ci_commit_pins/spmd_types.txt spmd_types.txt
+RUN bash ./install_conda.sh && rm install_conda.sh install_magma_conda.sh common_utils.sh /opt/conda/requirements-ci.txt /opt/conda/requirements-docs.txt spmd_types.txt
 
 # Install gcc
 ARG GCC_VERSION
