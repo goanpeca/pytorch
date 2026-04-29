@@ -15,7 +15,7 @@ handling of iterator operations during code transformation and optimization.
 
 import itertools
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, TYPE_CHECKING
 
 from .. import graph_break_hints, polyfills, variables
@@ -31,10 +31,11 @@ from ..exc import (
     raise_value_error,
     unimplemented,
 )
+from ..utils import unpack_iterable
 from .base import ValueMutationNew, VariableTracker
 from .constant import ConstantVariable
 from .hashable import HashableTracker
-from .object_protocol import generic_iternext, unpack_iterator
+from .object_protocol import generic_iternext
 
 
 if TYPE_CHECKING:
@@ -92,7 +93,7 @@ class ItertoolsVariable(VariableTracker):
                 r = kwargs["repeat"].as_python_constant()
             else:
                 r = 1
-            seqs = [unpack_iterator(tx, arg) for arg in args]
+            seqs = [unpack_iterable(tx, arg) for arg in args]
             items = [
                 variables.TupleVariable(list(item))
                 for item in itertools.product(*seqs, repeat=r)
@@ -107,7 +108,7 @@ class ItertoolsVariable(VariableTracker):
             and len(args) == 2
             and args[1].is_python_constant()
         ):
-            iterable = unpack_iterator(tx, args[0])
+            iterable = unpack_iterable(tx, args[0])
             r = args[1].as_python_constant()
 
             items = []
@@ -155,7 +156,7 @@ class ItertoolsVariable(VariableTracker):
                         *graph_break_hints.SUPPORTABLE,
                     ],
                 )
-            seq = unpack_iterator(tx, args[0])
+            seq = unpack_iterable(tx, args[0])
 
             if "key" in kwargs:
 
@@ -231,9 +232,7 @@ class ItertoolsVariable(VariableTracker):
                 r = None
             items = [
                 variables.TupleVariable(list(item))
-                for item in itertools.permutations(
-                    unpack_iterator(tx, args[0]), r
-                )
+                for item in itertools.permutations(unpack_iterable(tx, args[0]), r)
             ]
             return variables.ListIteratorVariable(
                 items,  # type: ignore[arg-type]
@@ -254,32 +253,6 @@ class IteratorVariable(VariableTracker):
             explanation="This abstract method must be implemented",
             hints=[*graph_break_hints.DYNAMO_BUG],
         )
-
-    # NOTE: only call when unpacking this iterator safely done eagerly!
-    # Normally, iterators are accessed lazily.
-    # Example of safe eager unpacking: list(map(f, seq))
-    # Example of unsafe eager unpacking: list(islice(map(f, seq), 5))
-    def force_unpack_var_sequence(
-        self, tx: "InstructionTranslator"
-    ) -> list[VariableTracker]:
-        result: list[VariableTracker] = []
-        self.force_apply_to_var_sequence(tx, result.append)
-        return result
-
-    def force_apply_to_var_sequence(
-        self, tx: "InstructionTranslator", fn: Callable[[Any], Any]
-    ) -> None:
-        while True:
-            try:
-                fn(self.tp_iternext_impl(tx))
-            except ObservedUserStopIteration:
-                handle_observed_exception(tx)
-                break
-
-    # don't call force_unpack_var_sequence since it can mutate
-    # IteratorVariable state!
-    def has_force_unpack_var_sequence(self, tx: "InstructionTranslator") -> bool:
-        return True
 
     def call_obj_hasattr(
         self, tx: "InstructionTranslator", name: str

@@ -644,6 +644,81 @@ Attempted to call function marked as skipped
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0007.html""",
         )
 
+    def test_unpack_sequence_with_wrong_length(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            a, b = [1]  # noqa: F841
+
+        self.assertExpectedInlineMunged(
+            Unsupported,
+            lambda: fn(
+                torch.randn(
+                    2,
+                )
+            ),
+            """\
+Length mismatch when unpacking object for UNPACK_SEQUENCE
+  Explanation: ListVariable(length=1) unpacked to a list for the UNPACK_SEQUENCE bytecode (i.e. `a, b, c = d`) with unexpected length.
+  Hint: This is likely to be a Dynamo bug. Please report an issue to PyTorch.
+
+  Developer debug context: expected length: 2, actual: 1
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0077.html
+
+from user code:
+   File "test_error_messages.py", line N, in fn
+    a, b = [1]  # noqa: F841""",
+        )
+
+    def test_unpack_sequence_with_non_iterable(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            a, b = 1  # noqa: RUF100
+
+        self.assertExpectedInlineMunged(
+            Unsupported,
+            lambda: fn(
+                torch.randn(
+                    2,
+                )
+            ),
+            """\
+Observed exception
+  Explanation: Dynamo found no exception handler at the top-level compiled function when encountering an exception. Exception will propagate outside the compiled region.
+  Hint: Your code may result in an error when running in eager. Please double check that your code doesn't contain a similar error when actually running eager/uncompiled. You can do this by removing the `torch.compile` call, or by using `torch.compiler.set_stance("force_eager")`.
+  Hint: It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues.
+
+  Developer debug context: raised exception TypeError("'int' object is not iterable")
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0088.html
+
+from user code:
+   File "test_error_messages.py", line N, in fn
+    a, b = 1  # noqa: RUF100""",
+        )
+
+    def test_unpack_ex_failure(self):
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            a, *b = []  # noqa: F841
+
+        self.assertExpectedInlineMunged(
+            Unsupported,
+            lambda: fn(torch.randn(2)),
+            """\
+Failed to unpack object for UNPACK_EX
+  Explanation: ListVariable(length=0) cannot be unpacked into a list for the UNPACK_EX bytecode.
+  Hint: Your code may result in an error when running in eager. Please double check that your code doesn't contain a similar error when actually running eager/uncompiled. You can do this by removing the `torch.compile` call, or by using `torch.compiler.set_stance("force_eager")`.
+
+  Developer debug context: ListVariable(length=0)
+
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0062.html
+
+from user code:
+   File "test_error_messages.py", line N, in fn
+    a, *b = []  # noqa: F841""",
+        )
+
     def test_observed_exception(self):
         def fn():
             raise RuntimeError("test")

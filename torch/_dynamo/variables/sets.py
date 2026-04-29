@@ -27,7 +27,13 @@ from ..bytecode_transformation import create_call_function, create_instruction
 from ..exc import raise_observed_exception
 from ..guards import GuardBuilder, install_guard
 from ..source import AttrSource, is_constant_source, is_from_local_source
-from ..utils import cmp_name_to_op_mapping, istype, raise_args_mismatch, set_methods
+from ..utils import (
+    cmp_name_to_op_mapping,
+    istype,
+    raise_args_mismatch,
+    set_methods,
+    unpack_iterable,
+)
 from .base import ValueMutationNew, VariableTracker
 from .constant import ConstantVariable
 from .hashable import HashableTracker, is_hashable, raise_unhashable
@@ -35,7 +41,10 @@ from .hashable import HashableTracker, is_hashable, raise_unhashable
 
 if TYPE_CHECKING:
     from torch._dynamo.codegen import PyCodegen
-    from torch._dynamo.symbolic_convert import InstructionTranslator
+    from torch._dynamo.symbolic_convert import (
+        InstructionTranslator,
+        InstructionTranslatorBase,
+    )
     from torch._dynamo.variables.builtin import BuiltinVariable
 
 
@@ -140,7 +149,9 @@ class SetVariable(VariableTracker):
             return id(value.realize()) != id(other.realize())
         return id(value) != id(other)
 
-    def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
+    def unpack_var_sequence(
+        self, tx: "InstructionTranslatorBase"
+    ) -> list[VariableTracker]:
         return [x.vt for x in self.items]
 
     def clone(self, **kwargs: Any) -> VariableTracker:
@@ -625,9 +636,7 @@ class OrderedSetClassVariable(VariableTracker):
             # pyrefly: ignore [implicit-any]
             items = []
         else:
-            from .object_protocol import unpack_iterator
-
-            items = unpack_iterator(tx, args[0])
+            items = unpack_iterable(tx, args[0])
         return variables.OrderedSetVariable(items, mutation_type=ValueMutationNew())
 
 
