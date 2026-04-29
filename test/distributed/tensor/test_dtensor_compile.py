@@ -325,13 +325,13 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1):
             """\
 def forward(self, args_0):
     _fn_args = (args_0, )
-    L_self_buffers_buffer_ , L_x_ , L_mesh_ , = self._dynamo_bytecode_flatten(*_fn_args)
+    L_mesh_ , L_self_buffers_buffer_ , L_x_ , = self._dynamo_bytecode_flatten(*_fn_args)
+    l_mesh_ = L_mesh_
     l_self_buffers_buffer_ = L_self_buffers_buffer_
     l_x_ = L_x_
-    l_mesh_ = L_mesh_
     from_local = torch.distributed.tensor._api.from_local(l_x_, l_mesh_, [torch.distributed.tensor.placement_types.Shard(dim=0)], run_check = False);  l_x_ = l_mesh_ = None
-    inter = l_self_buffers_buffer_ + from_local;  l_self_buffers_buffer_ = from_local = None
-    to_local = inter.to_local();  inter = None
+    add = l_self_buffers_buffer_ + from_local;  l_self_buffers_buffer_ = from_local = None
+    to_local = add.to_local();  add = None
     return self._dynamo_bytecode_unflatten((to_local,), _fn_args)""",  # noqa: B950
         )
 
