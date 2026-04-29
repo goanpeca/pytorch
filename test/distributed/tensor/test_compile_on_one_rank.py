@@ -10,6 +10,9 @@ import torch.distributed.config as dist_config
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import parallelize_module, RowwiseParallel
+from torch.testing._internal.common_distributed import (
+    DynamoDistributedSingleProcTestCase,
+)
 from torch.testing._internal.common_utils import run_tests, TEST_WITH_DEV_DBG_ASAN
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
@@ -178,6 +181,33 @@ class TestCompileOnOneRank(DTensorTestBase):
 
         compiled_f(dt)
         self._assert_graphs_identical_across_ranks(fw_graph_cell[0])
+
+    @dist_config.patch(compile_on_one_rank=True)
+    def test_all_reduce_with_implicit_world_group(self):
+        """`dist.all_reduce(t)` with no `group=` (implicit `dist.group.WORLD`)
+        should compile under compile_on_one_rank=True.
+
+        `WorldMetaClassVariable.var_getattr` was routing the WORLD lookup through
+        `SourcelessBuilder`, dropping the source it had just constructed for the
+        guard. The resulting `TorchScriptObjectVariable` had the raw ProcessGroup
+        as its `proxy` field and blew up later in `as_proxy()` when the PG was
+        passed to `_c10d_functional.all_reduce` (which only happens with
+        compile_on_one_rank=True, since otherwise the PG is converted to a
+        string group name before becoming an op arg).
+
+        Uses backend="aot_eager" to isolate the Dynamo-side fix.
+        Regression test for https://github.com/pytorch/pytorch/issues/181890.
+        """
+
+        def f(t):
+            t = t.clone()
+            dist.all_reduce(t)
+            return t + 1
+
+        x = torch.arange(4, dtype=torch.float32, device=self.device)
+        opt = torch.compile(f, backend="aot_eager", fullgraph=True)
+        out = opt(x)
+        self.assertEqual(out, f(x))
 
 
 if __name__ == "__main__":
