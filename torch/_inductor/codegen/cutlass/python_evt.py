@@ -20,6 +20,331 @@ from ...virtualized import V
 _ACCUMULATOR_ARG_NAME = "accum"
 
 
+class _SiLUReconstituter:
+    """Detects the decomposed SiLU pattern and replaces it with ops.silu().
+
+    Inductor decomposes silu(x) as x / (1 + exp(-x)), which produces ops:
+      neg, exp, constant(1), add, truediv
+    CUTLASS EVT has native silu support but cannot handle scalar constants
+    from the decomposed form. This class wraps the ops handler to detect
+    the pattern and emit a single ops.silu() call instead.
+
+    Handles two patterns:
+    - Pure SiLU: silu(load(buf))
+    - SiLU * aux: silu(load(buf_a)) * load(buf_b)
+    """
+
+    def __init__(self, inner_fn: Any, index_vars: Any):
+        self._inner_fn = inner_fn
+        self._index_vars = index_vars
+        self._pattern: str | None = None  # "silu" or "silu_mul"
+        self._silu_input: _LoadCapture | None = None
+        self._mul_input: _LoadCapture | None = None
+
+    def detect(self) -> bool:
+        """Run inner_fn through a recording handler to detect SiLU pattern."""
+        from unittest.mock import patch
+
+        from torch._inductor.ir import FlexibleLayout
+
+        recorder = _OpRecorder()
+        try:
+            with (
+                virtualized.V.set_ops_handler(recorder),  # type: ignore[arg-type]
+                patch.object(FlexibleLayout, "allow_indexing", True),
+            ):
+                self._inner_fn(self._index_vars)
+        except Exception:
+            return False
+
+        # Try pure SiLU first, then silu*mul
+        result = recorder.detect_silu()
+        if result is not None:
+            self._pattern = "silu"
+            self._silu_input = result
+            return True
+
+        result_mul = recorder.detect_silu_mul()
+        if result_mul is not None:
+            self._pattern = "silu_mul"
+            self._silu_input, self._mul_input = result_mul
+            return True
+
+        return False
+
+    def make_replacement_inner_fn(self) -> Any:
+        """Create a replacement inner_fn using native silu()."""
+        assert self._pattern is not None
+        silu_input = self._silu_input
+
+        if self._pattern == "silu":
+
+            def silu_inner_fn(index: Any) -> Any:
+                x = silu_input.load_fn(index)  # type: ignore[union-attr]
+                return virtualized.ops.silu(x)  # type: ignore[attr-defined]
+
+            return silu_inner_fn
+
+        else:  # silu_mul
+            mul_input = self._mul_input
+
+            def silu_mul_inner_fn(index: Any) -> Any:
+                x = silu_input.load_fn(index)  # type: ignore[union-attr]
+                y = mul_input.load_fn(index)  # type: ignore[union-attr]
+                return virtualized.ops.mul(virtualized.ops.silu(x), y)  # type: ignore[attr-defined]
+
+            return silu_mul_inner_fn
+
+
+class _LoadCapture:
+    """Captures a load operation for replay in the replacement inner_fn."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def load_fn(self, index: Any) -> Any:
+        graph = virtualized.V.graph
+        buf = graph.name_to_buffer.get(self.name) or graph.graph_inputs.get(self.name)
+        if buf is None:
+            raise KeyError(f"Buffer {self.name!r} not found in graph buffers or inputs")
+        return buf.make_loader()(index)
+
+
+@contextmanager
+def reconstitute_silu(node: ComputedBuffer) -> Generator[None, None, None]:
+    """Context manager that temporarily replaces decomposed SiLU with native silu().
+
+    Use this around any call to node.get_store_function()() where the node's
+    inner_fn may contain the decomposed SiLU pattern (neg, exp, constant, add,
+    truediv). Restores the original inner_fn on exit.
+
+    If the pattern is not detected, does nothing.
+    """
+    if not isinstance(node.data, Pointwise):
+        yield
+        return
+
+    index_vars = CutlassEVTCodegen.get_index_vars(node)
+    recon = _SiLUReconstituter(node.data.inner_fn, index_vars)
+
+    if not recon.detect():
+        yield
+        return
+
+    replacement_fn = recon.make_replacement_inner_fn()
+    orig_inner_fn = node.data.inner_fn
+    try:
+        object.__setattr__(node.data, "inner_fn", replacement_fn)
+        yield
+    finally:
+        object.__setattr__(node.data, "inner_fn", orig_inner_fn)
+
+
+class _OpRecorder:
+    """Records ops calls and detects the SiLU decomposition pattern.
+
+    SiLU decomposes as: x / (1 + exp(-x))
+    The ops sequence is: load → neg → exp → constant(1) → add → truediv
+    with to_dtype calls possibly interspersed.
+
+    Returns OpsValue wrappers so that Python arithmetic operators (like -x)
+    correctly dispatch through ops.neg(x) etc.
+    """
+
+    def __init__(self) -> None:
+        self._ops: list[tuple[str, str, tuple[Any, ...], dict[str, Any]]] = []
+        self._counter = 0
+
+    def _next_val(self) -> str:
+        val = f"_rec_{self._counter}"
+        self._counter += 1
+        return val
+
+    def __getattr__(self, name: str) -> Any:
+        def handler(*args: Any, **kwargs: Any) -> OpsValue:
+            val = self._next_val()
+            # Unwrap OpsValue args for clean recording
+            unwrapped_args = tuple(
+                a.value if isinstance(a, OpsValue) else a for a in args
+            )
+            self._ops.append((name, val, unwrapped_args, kwargs))
+            return OpsValue(val)
+
+        return handler
+
+    def _build_dtype_resolver(self) -> tuple[dict[str, str], Any]:
+        """Build a mapping from to_dtype outputs to their inputs."""
+        dtype_through: dict[str, str] = {}
+        for name, val, args, _kwargs in self._ops:
+            if name == "to_dtype" and len(args) >= 1:
+                dtype_through[val] = str(args[0])
+
+        def resolve(v: str) -> str:
+            """Follow to_dtype chain to find the original value."""
+            while v in dtype_through:
+                v = dtype_through[v]
+            return v
+
+        return dtype_through, resolve
+
+    def _get_core_ops(
+        self,
+    ) -> tuple[
+        list[tuple[str, str, tuple[Any, ...]]],
+        dict[str, list[tuple[str, str, tuple[Any, ...]]]],
+    ]:
+        """Get core ops (excluding to_dtype and store) grouped by name."""
+        core_ops: list[tuple[str, str, tuple[Any, ...]]] = [
+            (name, val, args)
+            for name, val, args, _kwargs in self._ops
+            if name not in ("to_dtype", "store")
+        ]
+        by_op: dict[str, list[tuple[str, str, tuple[Any, ...]]]] = {}
+        for name, val, args in core_ops:
+            by_op.setdefault(name, []).append((name, val, args))
+        return core_ops, by_op
+
+    def _verify_silu_dataflow(
+        self,
+        loads: list[tuple[str, str, tuple[Any, ...]]],
+        by_op: dict[str, list[tuple[str, str, tuple[Any, ...]]]],
+        resolve: Any,
+    ) -> str | None:
+        """Verify SiLU data-flow edges and return the buffer name, or None."""
+        load_vals = OrderedSet([op[1] for op in loads])
+        load_names = OrderedSet([op[2][0] for op in loads])
+        if len(load_names) != 1:
+            return None
+
+        neg_op = by_op["neg"][0]
+        exp_op = by_op["exp"][0]
+        const_op = by_op["constant"][0]
+        add_op = by_op["add"][0]
+        div_op = by_op["truediv"][0]
+
+        neg_input = resolve(str(neg_op[2][0]))
+        exp_input = resolve(str(exp_op[2][0]))
+        add_inputs = OrderedSet(
+            [resolve(str(add_op[2][0])), resolve(str(add_op[2][1]))]
+        )
+        div_num = resolve(str(div_op[2][0]))
+        div_den = resolve(str(div_op[2][1]))
+
+        if not (
+            neg_input in load_vals
+            and exp_input == neg_op[1]
+            and const_op[2][0] == 1
+            and add_inputs == OrderedSet([const_op[1], exp_op[1]])
+            and div_num in load_vals
+            and div_den == add_op[1]
+        ):
+            return None
+
+        return next(iter(load_names))
+
+    def detect_silu(self) -> _LoadCapture | None:
+        """Check if recorded ops form the SiLU decomposition pattern.
+
+        Only matches when the entire inner_fn is a pure SiLU on a single load
+        (possibly with to_dtype wrappers). Does not match SiLU as part of a
+        larger expression (e.g., silu(x) * y).
+
+        The ops order may vary (e.g., constant before neg), so we match by
+        data-flow edges rather than positional order. to_dtype ops are treated
+        as transparent wrappers and followed through in the data-flow graph.
+
+        The real inductor decomposition loads the same buffer twice (x appears
+        in both numerator and denominator), so we allow 2 loads of the same
+        buffer.
+
+        Returns _LoadCapture for the SiLU input if detected, None otherwise.
+        """
+        _, resolve = self._build_dtype_resolver()
+        _core_ops, by_op = self._get_core_ops()
+
+        required = OrderedSet(["load", "neg", "exp", "constant", "add", "truediv"])
+        if by_op.keys() != required:
+            return None
+
+        loads = by_op["load"]
+        if len(loads) not in (1, 2):
+            return None
+        if any(len(by_op[k]) != 1 for k in required - OrderedSet(["load"])):
+            return None
+
+        load_name = self._verify_silu_dataflow(loads, by_op, resolve)
+        if load_name is None:
+            return None
+        return _LoadCapture(load_name)
+
+    def detect_silu_mul(self) -> tuple[_LoadCapture, _LoadCapture] | None:
+        """Check if recorded ops form the silu(x) * y pattern.
+
+        Matches: silu(load(buf_a)) * load(buf_b)
+        where silu decomposes as x / (1 + exp(-x)).
+
+        Returns (silu_input_capture, mul_input_capture) if detected.
+        """
+        _, resolve = self._build_dtype_resolver()
+        _core_ops, by_op = self._get_core_ops()
+
+        required = OrderedSet(
+            ["load", "neg", "exp", "constant", "add", "truediv", "mul"]
+        )
+        if by_op.keys() != required:
+            return None
+
+        loads = by_op["load"]
+        if len(loads) not in (2, 3):
+            return None
+        if any(len(by_op[k]) != 1 for k in required - OrderedSet(["load"])):
+            return None
+
+        # Identify which loads belong to the SiLU and which to the mul operand.
+        # The truediv result feeds into mul; the other mul operand is a load
+        # from a DIFFERENT buffer.
+        div_op = by_op["truediv"][0]
+        mul_op = by_op["mul"][0]
+        mul_inputs = OrderedSet(
+            [resolve(str(mul_op[2][0])), resolve(str(mul_op[2][1]))]
+        )
+
+        # One mul input should be the truediv result (SiLU output)
+        if div_op[1] not in mul_inputs:
+            return None
+
+        # The other mul input should trace back to a load of a different buffer
+        other_mul_input = (mul_inputs - OrderedSet([div_op[1]])).pop()
+
+        # Find which load the other_mul_input came from
+        other_load = None
+        for load_op in loads:
+            if load_op[1] == other_mul_input:
+                other_load = load_op
+                break
+        if other_load is None:
+            return None
+
+        # The remaining loads (excluding other_load) should all be for the
+        # SiLU buffer
+        silu_loads = [op for op in loads if op is not other_load]
+        silu_load_names = OrderedSet([op[2][0] for op in silu_loads])
+        if len(silu_load_names) != 1:
+            return None
+
+        # Verify SiLU data-flow on the silu_loads
+        silu_name = self._verify_silu_dataflow(silu_loads, by_op, resolve)
+        if silu_name is None:
+            return None
+
+        other_name = other_load[2][0]
+        if silu_name == other_name:
+            # Both buffers are the same — this isn't the mul pattern
+            return None
+
+        return (_LoadCapture(silu_name), _LoadCapture(other_name))
+
+
 def scaled_mm_evt(
     scale_A_name: str, scale_B_name: str, bias_name: str | None, output_name: str
 ) -> tuple[list[str], dict[str, Any], str]:
@@ -64,7 +389,17 @@ class CutlassEVTOpsMixIn:
 
     @staticmethod
     def constant(value: Any, dtype: Any) -> str:
-        raise NotImplementedError
+        return str(value)
+
+    @staticmethod
+    def neg(x0: str) -> str:
+        # Use subtraction from zero instead of unary minus because the
+        # CUTLASS PythonASTFrontend has visit_BinOp but no visit_UnaryOp.
+        return f"(0.0 - {x0})"
+
+    @staticmethod
+    def silu(x0: str) -> str:
+        return CutlassEVTOpsMixIn._prefix_un_op("silu", x0)
 
     @staticmethod
     def mul(x0: str, x1: str) -> str:
@@ -197,7 +532,10 @@ class CutlassEVTCodegen(CutlassEVTOpsMixIn):
                 assert isinstance(node, ComputedBuffer)
                 with codegen.set_cur_node(node):
                     index_vars = CutlassEVTCodegen.get_index_vars(node)
-                    node.get_store_function()(index_vars)
+                    # Reconstitute decomposed SiLU pattern to native silu()
+                    # for CUTLASS EVT. See reconstitute_silu() docstring.
+                    with reconstitute_silu(node):
+                        node.get_store_function()(index_vars)
 
         codegen.finalize()
 

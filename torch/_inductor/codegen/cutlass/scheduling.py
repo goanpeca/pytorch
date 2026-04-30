@@ -7,6 +7,7 @@ from typing import cast, TypeGuard
 from torch._inductor.codegen.cutlass.python_evt import (
     CutlassEVTCodegen,
     MockCutlassHandler,
+    reconstitute_silu,
 )
 from torch._inductor.utils import Placeholder
 from torch.utils._ordered_set import OrderedSet
@@ -160,7 +161,10 @@ class CUTLASSScheduling(BaseScheduling):
                     assert isinstance(
                         node, ComputedBuffer
                     )  # Not sure why we need to do this again
-                    node.get_store_function()(CutlassEVTCodegen.get_index_vars(node))
+                    with reconstitute_silu(node):
+                        node.get_store_function()(
+                            CutlassEVTCodegen.get_index_vars(node)
+                        )
 
         with V.set_kernel_handler(kernel):
             src_code = render()

@@ -351,6 +351,166 @@ return tmp_1, D""",
     @skipXPUIf(not Xe2_Or_Later, "Unsupported platform")
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
+    def test_py_codegen_neg_constant(self):
+        """Test EVT codegen for neg and constant ops (used in decomposed SiLU)."""
+        from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
+        from torch._inductor.virtualized import ops, V
+
+        size = (100, 300, 200)
+        buf0 = MockComputedBuffer("buf0", None, torch.float32, size)
+
+        def inner_fn(index):
+            x = buf0.make_loader()(index)
+            c = ops.constant(1, torch.float32)
+            return c + ops.exp(ops.neg(x))
+
+        buf1 = MockComputedBuffer("buf1", inner_fn, torch.float32, size)
+        with V.set_graph_handler(
+            MockGraphHandler({"buf0": buf0, "buf1": buf1})
+        ):
+            reads, writes, renames, code = CutlassEVTCodegen.ir_to_evt_python_code(
+                "buf0",
+                [MockSchedulerNode(buf1)],
+                OrderedSet([]),
+            )
+        self.assertExpectedInline(reads, """[]""")
+        self.assertExpectedInline(writes, """['buf0', 'buf1']""")
+        self.assertExpectedInline(
+            code,
+            """\
+def fn(accum):
+    tmp_0 = accum
+    tmp_1 = 1
+    tmp_2 = (0.0 - tmp_0)
+    tmp_3 = exp(tmp_2)
+    D = tmp_1 + tmp_3
+
+return tmp_0, D""",
+        )
+
+    @skipXPUIf(not Xe2_Or_Later, "Unsupported platform")
+    @skipCUDAIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
+    def test_py_codegen_silu(self):
+        """Test EVT codegen for SiLU: decomposed form is reconstituted to native silu()."""
+        from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
+        from torch._inductor.virtualized import ops, V
+
+        size = (100, 300, 200)
+        buf0 = MockComputedBuffer("buf0", None, torch.float32, size)
+
+        def inner_fn_silu(index):
+            x = buf0.make_loader()(index)
+            one = ops.constant(1, torch.float32)
+            return x / (one + ops.exp(-x))
+
+        buf1 = MockComputedBuffer("buf1", inner_fn_silu, torch.float32, size)
+        with V.set_graph_handler(
+            MockGraphHandler({"buf0": buf0, "buf1": buf1})
+        ):
+            reads, writes, renames, code = CutlassEVTCodegen.ir_to_evt_python_code(
+                "buf0",
+                [MockSchedulerNode(buf1)],
+                OrderedSet([]),
+            )
+        self.assertExpectedInline(reads, """[]""")
+        self.assertExpectedInline(writes, """['buf0', 'buf1']""")
+        self.assertExpectedInline(
+            code,
+            """\
+def fn(accum):
+    tmp_0 = accum
+    D = silu(tmp_0)
+
+return tmp_0, D""",
+        )
+
+    @skipXPUIf(not Xe2_Or_Later, "Unsupported platform")
+    @skipCUDAIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
+    def test_py_codegen_aux_load_mul(self):
+        """Test EVT codegen for accum * external_buffer (AuxLoad pattern)."""
+        from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
+        from torch._inductor.virtualized import V
+
+        size = (100, 300, 200)
+        buf0 = MockComputedBuffer("buf0", None, torch.float32, size)
+        buf1 = MockComputedBuffer("buf1", None, torch.float32, size)
+
+        def inner_fn(index):
+            acc = buf0.make_loader()(index)
+            ext = buf1.make_loader()(index)
+            return acc * ext
+
+        buf2 = MockComputedBuffer("buf2", inner_fn, torch.float32, size)
+        with V.set_graph_handler(
+            MockGraphHandler({"buf0": buf0, "buf1": buf1, "buf2": buf2})
+        ):
+            reads, writes, renames, code = CutlassEVTCodegen.ir_to_evt_python_code(
+                "buf0",
+                [MockSchedulerNode(buf2)],
+                OrderedSet([]),
+            )
+        self.assertExpectedInline(reads, """['buf1']""")
+        self.assertExpectedInline(writes, """['buf0', 'buf2']""")
+        self.assertExpectedInline(
+            code,
+            """\
+def fn(accum, buf1):
+    tmp_0 = accum
+    D = tmp_0 * buf1
+
+return tmp_0, D""",
+        )
+
+    @skipXPUIf(not Xe2_Or_Later, "Unsupported platform")
+    @skipCUDAIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
+    def test_py_codegen_silu_mul_aux(self):
+        """Test EVT codegen for SiLU(accum) * external_buffer (Llama MLP pattern).
+
+        The SiLU reconstituter detects the silu(x)*y pattern and replaces it
+        with native silu(accum) * aux_load.
+        """
+        from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
+        from torch._inductor.virtualized import ops, V
+
+        size = (100, 300, 200)
+        buf0 = MockComputedBuffer("buf0", None, torch.float32, size)
+        buf1 = MockComputedBuffer("buf1", None, torch.float32, size)
+
+        def inner_fn_silu_mul(index):
+            acc = buf0.make_loader()(index)
+            up = buf1.make_loader()(index)
+            one = ops.constant(1, torch.float32)
+            silu = acc / (one + ops.exp(-acc))
+            return silu * up
+
+        buf2 = MockComputedBuffer("buf2", inner_fn_silu_mul, torch.float32, size)
+        with V.set_graph_handler(
+            MockGraphHandler({"buf0": buf0, "buf1": buf1, "buf2": buf2})
+        ):
+            reads, writes, renames, code = CutlassEVTCodegen.ir_to_evt_python_code(
+                "buf0",
+                [MockSchedulerNode(buf2)],
+                OrderedSet([]),
+            )
+        self.assertExpectedInline(reads, """['buf1']""")
+        self.assertExpectedInline(writes, """['buf0', 'buf2']""")
+        self.assertExpectedInline(
+            code,
+            """\
+def fn(accum, buf1):
+    tmp_0 = accum
+    tmp_1 = silu(tmp_0)
+    D = tmp_1 * buf1
+
+return tmp_0, D""",
+        )
+
+    @skipXPUIf(not Xe2_Or_Later, "Unsupported platform")
+    @skipCUDAIf(not SM90OrLater, "need sm_90")
+    @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_example_tensor_creation(self):
         from torch._inductor.codegen.cutlass.lib_extensions.evt_extensions import (
             create_example_tensors,
